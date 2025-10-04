@@ -1,0 +1,53 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+import scipy.io
+from matplotlib.animation import FuncAnimation, FFMpegWriter
+import types, pickle
+from sklearn.neighbors import NearestNeighbors
+
+# Grid
+x = np.linspace(-3, 3, 100)
+y = np.linspace(-3, 3, 100)
+X, Y = np.meshgrid(x, y)
+
+# Surface function
+def surface(frame):
+    return np.exp(-(X**2 + Y**2)) * (1 + 0.3*np.sin(0.2*frame))
+
+# Fake robot trajectories (N robots moving in circle)
+N_robots = 50
+steps = 60
+theta = np.linspace(0, 2*np.pi, steps)
+X_old = np.zeros((steps, N_robots, 2))
+for i in range(N_robots):
+    r = 1 + 0.02*i
+    X_old[:, i, 0] = r * np.cos(theta + i*np.pi/15)  # x positions
+    X_old[:, i, 1] = r * np.sin(theta + i*np.pi/15)  # y positions
+
+# Figure
+fig, ax = plt.subplots()
+im = ax.imshow(surface(0), extent=[-3, 3, -3, 3], origin="lower",
+               cmap="viridis", aspect="auto")
+scatter = ax.scatter(X_old[0,:,0], X_old[0,:,1], c='r', marker='x', s=20)
+cbar = plt.colorbar(im, ax=ax)
+cbar.set_label("Z value")
+ax.set_xlabel("X")
+ax.set_ylabel("Y")
+
+# Update function
+def update(frame):
+    Z = surface(frame)
+    im.set_data(Z)  # update heatmap
+    scatter.set_offsets(X_old[frame])  # update robot positions
+    ax.set_title(f"Frame {frame}")
+    return [im, scatter]
+
+# Animate
+anim = animation.FuncAnimation(fig, update, frames=steps, interval=100, blit=True)
+
+#plt.show()
+
+
+writer = FFMpegWriter(fps=10, bitrate=3000)
+anim.save("robot_behaviour_based_v1.mp4", writer=writer)
