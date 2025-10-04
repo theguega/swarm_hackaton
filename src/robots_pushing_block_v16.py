@@ -126,3 +126,4 @@ ani = animation.FuncAnimation(fig, update, frames=len(block_traj), interval=100,
 ax.legend()
 ax.set_title("Robots Collaboratively Pushing Block with Collision Avoidance")
 plt.show()
+
