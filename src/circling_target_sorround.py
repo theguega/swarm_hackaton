@@ -1,96 +1,110 @@
 #!/usr/bin/env python3
-"""
-swarm_controller.py
-
-Spawns N robots into Gazebo (using spawn_model service) and runs the
-grid-search -> surround -> stop routine you provided. It publishes
-geometry_msgs/Twist to each robot namespace's /cmd_vel topic.
-
-IMPORTANT:
- - Replace robot_model_path param to point to your Herobot URDF or SDF.
- - Adjust per-robot cmd_vel topic if your Herobot uses a different topic name.
-"""
 
 import rospy
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import LaserScan
 import numpy as np
-import os
-from gazebo_msgs.srv import SpawnModel, SpawnModelRequest, DeleteModel
-from geometry_msgs.msg import Pose, Point, Quaternion, Twist
-from std_srvs.srv import Empty
+import tf
 
-def world_pose_from_cell(ix, iy, cell_size, z=0.0, origin=(0.0,0.0)):
-    # Convert integer grid cell → world coordinates (center of cell)
-    ox, oy = origin
-    x = ox + (ix + 0.5) * cell_size
-    y = oy + (iy + 0.5) * cell_size
-    return x, y, z
+# --- PARAMETERS ---
+Lx, Ly = 20.0, 20.0  # meters
+cell_size = 1.0
+nx, ny = int(Lx / cell_size), int(Ly / cell_size)
+N_ROBOTS = 10
+ROBOT_IDS = [f"robot_{i}" for i in range(N_ROBOTS)]
+TARGETS = [(15, 15), (5, 5)]  # Example target positions in grid coordinates
+GOAL_TOLERANCE = 0.5  # meters
+LINEAR_SPEED = 0.3  # m/s
+ANGULAR_SPEED = 0.5  # rad/s
+SURROUND_RADIUS = 3.0 # meters
+MARGIN = 1.0 # minimum distance from walls
 
-class SwarmController(object):
+class SwarmController:
     def __init__(self):
-        rospy.init_node('swarm_controller', anonymous=False)
+        rospy.init_node("swarm_controller")
 
-        # Params
-        self.Lx = rospy.get_param('~Lx', 20.0)
-        self.Ly = rospy.get_param('~Ly', 20.0)
-        self.cell_size = rospy.get_param('~cell_size', 1.0)
-        self.nx = int(self.Lx / self.cell_size)
-        self.ny = int(self.Ly / self.cell_size)
-        self.N_robots = int(rospy.get_param('~n_robots', 10))
-        self.margin = int(rospy.get_param('~margin', 1))
-        self.robot_model_path = rospy.get_param('~robot_model_path', '')
+        self.robot_poses = [None] * N_ROBOTS
+        self.robot_orientations = [None] * N_ROBOTS
 
-        # Load model XML (URDF or SDF)
-        if not self.robot_model_path or not os.path.isfile(self.robot_model_path):
-            rospy.logwarn("robot_model_path NOT found or empty. Put your URDF/SDF path in param robot_model_path")
-            self.model_xml = ""
-        else:
-            with open(self.robot_model_path, 'r') as f:
-                self.model_xml = f.read()
-
-        # Gazebo spawn client
-        rospy.loginfo("Waiting for /gazebo/spawn_urdf_model or /gazebo/spawn_sdf_model service...")
-        rospy.wait_for_service('/gazebo/spawn_urdf_model', timeout=15.0)
-        self.spawn_srv = rospy.ServiceProxy('/gazebo/spawn_urdf_model', SpawnModel)
-
-        # Prepare publishers for each robot
+        self.odom_subs = []
+        self.laser_subs = []
         self.cmd_pubs = []
-        for i in range(self.N_robots):
-            ns = f"/robot_{i}"
-            topic = ns + "/cmd_vel"
-            pub = rospy.Publisher(topic, Twist, queue_size=1)
-            self.cmd_pubs.append(pub)
 
-        # Build occupancy grid and targets like your script
-        self.grid = -np.ones((self.nx, self.ny), dtype=int)  # -1 unknown, 0 visited, 2 target
-        self.targets = []
-        num_targets = 2
-        while len(self.targets) < num_targets:
-            tx, ty = np.random.randint(0, self.nx), np.random.randint(0, self.ny)
-            if (tx, ty) not in self.targets:
-                self.targets.append((tx, ty))
-                self.grid[tx, ty] = 2
+        for i, robot_id in enumerate(ROBOT_IDS):
+            self.odom_subs.append(
+                rospy.Subscriber(f"/{robot_id}/odom", Odometry, self.odom_callback, i)
+            )
+            self.laser_subs.append(
+                rospy.Subscriber(f"/{robot_id}/laser", LaserScan, self.laser_callback, i)
+            )
+            self.cmd_pubs.append(
+                rospy.Publisher(f"/{robot_id}/cmd_vel", Twist, queue_size=1)
+            )
 
-        # Place robots initially at random cells
-        self.robots = np.column_stack((np.random.randint(0, self.nx, self.N_robots),
-                                       np.random.randint(0, self.ny, self.N_robots)))
-        # Create paths (same helper functions as original)
-        self.paths = [self.wall_then_spiral(int(self.robots[i,0]), int(self.robots[i,1]), self.nx, self.ny) for i in range(self.N_robots)]
-        self.indices = np.zeros(self.N_robots, dtype=int)
-
-        # State flags
-        self.target_found = False
+        # --- STATE ---
+        self.state = "SEARCHING"
+        self.target_found_by = -1
         self.chosen_target = None
-        self.surround_positions = None
-        self.all_stopped = False
+        self.surround_positions = [None] * N_ROBOTS
+        self.robots_at_surround_pos = [False] * N_ROBOTS
 
-        # Spawn models at initial world poses
-        self.spawn_robots()
+        # --- PATHS ---
+        self.paths = self.precompute_paths()
+        self.path_indices = np.zeros(N_ROBOTS, dtype=int)
 
-        # Main timer to step simulation logic and command robots (10 Hz)
-        self.rate = rospy.Rate(10)
-        self.run_loop()
+        rospy.loginfo("Swarm controller initialized.")
 
-    # --- Helper path functions (copied) ---
+    def odom_callback(self, msg, robot_index):
+        """Updates robot position and orientation."""
+        pos = msg.pose.pose.position
+        self.robot_poses[robot_index] = (pos.x, pos.y)
+
+        orientation_q = msg.pose.pose.orientation
+        orientation_list = [
+            orientation_q.x,
+            orientation_q.y,
+            orientation_q.z,
+            orientation_q.w,
+        ]
+        (roll, pitch, yaw) = tf.transformations.euler_from_quaternion(orientation_list)
+        self.robot_orientations[robot_index] = yaw
+
+    def laser_callback(self, msg, robot_index):
+        """Placeholder for obstacle avoidance."""
+        # TODO: Implement obstacle avoidance logic
+        pass
+
+    def world_to_grid(self, world_pos):
+        """Converts world coordinates to grid coordinates."""
+        if world_pos is None:
+            return None
+        grid_x = int(world_pos[0] / cell_size)
+        grid_y = int(world_pos[1] / cell_size)
+        return (grid_x, grid_y)
+
+    def grid_to_world(self, grid_pos):
+        """Converts grid coordinates to world coordinates."""
+        world_x = (grid_pos[0] + 0.5) * cell_size
+        world_y = (grid_pos[1] + 0.5) * cell_size
+        return (world_x, world_y)
+
+    def precompute_paths(self):
+        """Precomputes Boustrophedon paths for each robot."""
+        paths = []
+        initial_grid_positions = [self.world_to_grid(self.robot_poses[i]) for i in range(N_ROBOTS)]
+
+        # Wait for initial poses
+        while any(pos is None for pos in initial_grid_positions):
+             rospy.sleep(0.1)
+             initial_grid_positions = [self.world_to_grid(self.robot_poses[i]) for i in range(N_ROBOTS)]
+
+
+        for i in range(N_ROBOTS):
+             x0, y0 = initial_grid_positions[i]
+             paths.append(self.wall_then_spiral(x0, y0, nx, ny))
+        return paths
+
     def boustrophedon_path(self, x_range, y_range):
         path = []
         for j, y in enumerate(y_range):
@@ -103,159 +117,158 @@ class SwarmController(object):
         return path
 
     def wall_then_spiral(self, x0, y0, nx, ny):
-        dists = [x0, nx-1-x0, y0, ny-1-y0]
-        wall = int(np.argmin(dists))
+        # ... (Same logic as in the simulation script)
+        dists = [x0, nx - 1 - x0, y0, ny - 1 - y0]
+        wall = np.argmin(dists)
         if wall == 0:
-            start_x, start_y = 0, y0; x_range = np.arange(0, nx); y_range = np.arange(start_y, ny)
+            start_x, start_y = 0, y0
+            x_range = np.arange(0, nx)
+            y_range = np.arange(start_y, ny)
         elif wall == 1:
-            start_x, start_y = nx-1, y0; x_range = np.arange(nx-1, -1, -1); y_range = np.arange(start_y, ny)
+            start_x, start_y = nx - 1, y0
+            x_range = np.arange(nx - 1, -1, -1)
+            y_range = np.arange(start_y, ny)
         elif wall == 2:
-            start_x, start_y = x0, 0; x_range = np.arange(0, nx); y_range = np.arange(0, ny)
+            start_x, start_y = x0, 0
+            x_range = np.arange(0, nx)
+            y_range = np.arange(0, ny)
         else:
-            start_x, start_y = x0, ny-1; x_range = np.arange(0, nx); y_range = np.arange(ny-1, -1, -1)
+            start_x, start_y = x0, ny - 1
+            x_range = np.arange(0, nx)
+            y_range = np.arange(ny - 1, -1, -1)
 
         path = []
-        if wall in [0,1]:
+        if wall in [0, 1]:
             step = -1 if x0 > start_x else 1
-            for xx in range(x0, start_x+step, step):
+            for xx in range(x0, start_x + step, step):
                 path.append((xx, y0))
         else:
             step = -1 if y0 > start_y else 1
-            for yy in range(y0, start_y+step, step):
+            for yy in range(y0, start_y + step, step):
                 path.append((x0, yy))
         path.extend(self.boustrophedon_path(x_range, y_range))
         return path
 
-    def spawn_robots(self):
-        # We convert grid cells to world XY (z=0.0)
-        rospy.loginfo("Spawning robots into Gazebo...")
-        for i in range(self.N_robots):
-            name = f"robot_{i}"
-            ix, iy = int(self.robots[i,0]), int(self.robots[i,1])
-            x, y, z = world_pose_from_cell(ix, iy, self.cell_size)
-            initial_pose = Pose()
-            initial_pose.position = Point(x=x, y=y, z=0.0)
-            initial_pose.orientation = Quaternion(0,0,0,1)
 
-            if not self.model_xml:
-                rospy.logwarn("No model XML loaded; skipping spawn (use param robot_model_path).")
-                continue
+    def move_to_goal(self, robot_index, goal_pos):
+        """Moves a robot towards a goal position."""
+        if self.robot_poses[robot_index] is None:
+            return
 
-            try:
-                req = SpawnModelRequest()
-                req.model_name = name
-                req.model_xml = self.model_xml
-                req.robot_namespace = f"/{name}"
-                req.initial_pose = initial_pose
-                req.reference_frame = "world"
-                resp = self.spawn_srv(req)
-                if resp.success:
-                    rospy.loginfo(f"Spawned {name} at cell ({ix},{iy}) -> world ({x:.2f},{y:.2f})")
-                else:
-                    rospy.logwarn(f"Spawn FAILED for {name}: {resp.status_message}")
-            except rospy.ServiceException as e:
-                rospy.logerr("Spawn service failed: " + str(e))
+        current_pos = self.robot_poses[robot_index]
+        current_angle = self.robot_orientations[robot_index]
+        dx = goal_pos[0] - current_pos[0]
+        dy = goal_pos[1] - current_pos[1]
+        distance = np.sqrt(dx**2 + dy**2)
 
-    def send_stop(self, i):
-        t = Twist()
-        self.cmd_pubs[i].publish(t)
+        if distance < GOAL_TOLERANCE:
+            return True  # Goal reached
 
-    def move_towards_cell(self, i, target_cell):
-        """
-        Simple discrete step controller: compute velocity needed from robot world pos to target cell world pos.
-        NOTE: This is a toy velocity controller for demonstration. Replace with your robot's controller if needed.
-        """
-        # Compute robot world position using its grid cell
-        cx_cell, cy_cell = int(self.robots[i,0]), int(self.robots[i,1])
-        cx, cy, _ = world_pose_from_cell(cx_cell, cy_cell, self.cell_size)
-        tx_cell, ty_cell = target_cell
-        tx, ty, _ = world_pose_from_cell(tx_cell, ty_cell, self.cell_size)
+        angle_to_goal = np.arctan2(dy, dx)
+        angle_diff = angle_to_goal - current_angle
 
-        dx = tx - cx
-        dy = ty - cy
-        # discrete step: decide a small velocity to move one cell per second-ish
-        vx = np.sign(dx) * 0.5  # tune as needed
-        vy = np.sign(dy) * 0.5
+        # Normalize angle
+        if angle_diff > np.pi:
+            angle_diff -= 2 * np.pi
+        if angle_diff < -np.pi:
+            angle_diff += 2 * np.pi
+
         twist = Twist()
-        # Many differential-drive robots take a linear x and angular z. Here we publish x/y which works for holonomic Herobot-like robots.
-        # If your robot accepts only Twist.linear.x and angular.z, convert accordingly.
-        twist.linear.x = vx
-        twist.linear.y = vy
-        self.cmd_pubs[i].publish(twist)
+        if abs(angle_diff) > 0.1:
+            twist.angular.z = ANGULAR_SPEED if angle_diff > 0 else -ANGULAR_SPEED
+        else:
+            twist.linear.x = LINEAR_SPEED
 
-    def run_loop(self):
-        steps = 800
-        t = 0
-        while not rospy.is_shutdown() and t < steps:
-            if self.all_stopped:
-                # send zero velocities
-                for i in range(self.N_robots):
-                    self.send_stop(i)
-                self.rate.sleep()
-                t += 1
+        self.cmd_pubs[robot_index].publish(twist)
+        return False # Goal not reached
+
+    def stop_robot(self, robot_index):
+        """Stops a robot."""
+        self.cmd_pubs[robot_index].publish(Twist())
+
+    def run(self):
+        """Main control loop."""
+        rate = rospy.Rate(10)  # 10 Hz
+
+        while not rospy.is_shutdown():
+            if self.state == "SEARCHING":
+                self.run_searching_state()
+            elif self.state == "TARGET_FOUND":
+                self.run_target_found_state()
+            elif self.state == "SURROUNDING":
+                self.run_surrounding_state()
+
+            rate.sleep()
+
+    def run_searching_state(self):
+        """Logic for the SEARCHING state."""
+        for i in range(N_ROBOTS):
+            if self.robot_poses[i] is None:
                 continue
 
-            if self.target_found:
-                # Move robots toward surround positions (cells)
-                done = True
-                for i in range(self.N_robots):
-                    tx, ty = self.surround_positions[i]
-                    cx, cy = int(self.robots[i,0]), int(self.robots[i,1])
-                    if (cx, cy) != (tx, ty):
-                        done = False
-                        # step robots by one cell toward target cell
-                        if cx < tx: cx += 1
-                        elif cx > tx: cx -= 1
-                        if cy < ty: cy += 1
-                        elif cy > ty: cy -= 1
-                        self.robots[i] = [cx, cy]
-                        # command robot velocity toward that cell
-                        self.move_towards_cell(i, (tx, ty))
+            # Check for target
+            current_grid_pos = self.world_to_grid(self.robot_poses[i])
+            if current_grid_pos in TARGETS:
+                tx, ty = self.grid_to_world(current_grid_pos)
 
-                if done:
-                    self.all_stopped = True
-                    rospy.loginfo(f"All robots reached surround positions at target {self.targets[self.chosen_target]}")
+                if tx < MARGIN or tx > Lx - MARGIN or ty < MARGIN or ty > Ly - MARGIN:
+                    rospy.logwarn(f"Robot {i} found target at {current_grid_pos}, but too close to wall. Continuing search.")
+                else:
+                    self.target_found_by = i
+                    self.chosen_target = self.grid_to_world(current_grid_pos)
+                    self.state = "TARGET_FOUND"
+                    rospy.loginfo(f"Robot {i} found target at {current_grid_pos}. Transitioning to TARGET_FOUND.")
+                    return # Exit to immediately start the next state
+
+
+            # Move along Boustrophedon path
+            if self.path_indices[i] < len(self.paths[i]):
+                goal_grid_pos = self.paths[i][self.path_indices[i]]
+                goal_world_pos = self.grid_to_world(goal_grid_pos)
+
+                if self.move_to_goal(i, goal_world_pos):
+                    self.path_indices[i] += 1
             else:
-                # keep searching
-                for i in range(self.N_robots):
-                    if self.indices[i] < len(self.paths[i]):
-                        self.robots[i] = self.paths[i][self.indices[i]]
-                        self.indices[i] += 1
+                self.stop_robot(i)
 
-                    x, y = int(self.robots[i,0]), int(self.robots[i,1])
-                    if (x, y) in self.targets and not self.target_found:
-                        tx, ty = x, y
-                        if tx < self.margin or tx > self.nx-1-self.margin or ty < self.margin or ty > self.ny-1-self.margin:
-                            rospy.loginfo(f"Robot {i} found target at {tx,ty} but too close to wall.")
-                        else:
-                            self.chosen_target = self.targets.index((tx,ty))
-                            self.target_found = True
-                            rospy.loginfo(f"Robot {i} found safe target at {tx,ty}. Computing surround positions.")
-                            # compute surround positions
-                            radius = 3
-                            self.surround_positions = {}
-                            for j in range(self.N_robots):
-                                angle = 2*np.pi * j / self.N_robots
-                                sx = tx + int(radius*np.cos(angle))
-                                sy = ty + int(radius*np.sin(angle))
-                                sx = min(max(0, sx), self.nx-1)
-                                sy = min(max(0, sy), self.ny-1)
-                                self.surround_positions[j] = (sx, sy)
-                            break
-                    elif self.grid[x, y] != 2:
-                        self.grid[x, y] = 0
+    def run_target_found_state(self):
+        """Calculates surround positions and transitions to SURROUNDING."""
+        rospy.loginfo("Calculating surround positions.")
+        tx, ty = self.chosen_target
+        for i in range(N_ROBOTS):
+            angle = 2 * np.pi * i / N_ROBOTS
+            sx = tx + SURROUND_RADIUS * np.cos(angle)
+            sy = ty + SURROUND_RADIUS * np.sin(angle)
+            self.surround_positions[i] = (sx, sy)
 
-                    # publish a small move command to follow the discrete path
-                    # publish toward next path cell if exists
-                    if self.indices[i] < len(self.paths[i]):
-                        next_cell = self.paths[i][self.indices[i]]
-                        self.move_towards_cell(i, next_cell)
+        self.state = "SURROUNDING"
+        rospy.loginfo("Transitioning to SURROUNDING state.")
 
-            self.rate.sleep()
-            t += 1
+    def run_surrounding_state(self):
+        """Moves robots to their surround positions."""
+        all_robots_at_pos = True
+        for i in range(N_ROBOTS):
+            if not self.robots_at_surround_pos[i]:
+                goal_pos = self.surround_positions[i]
+                if self.move_to_goal(i, goal_pos):
+                    self.robots_at_surround_pos[i] = True
+                    self.stop_robot(i)
+                    rospy.loginfo(f"Robot {i} has reached its surround position.")
+                all_robots_at_pos = False
+
+        if all_robots_at_pos:
+            rospy.loginfo("All robots are surrounding the target. Mission complete.")
+            # Stop all robots for safety
+            for i in range(N_ROBOTS):
+                self.stop_robot(i)
+            rospy.signal_shutdown("Mission Complete")
+
 
 if __name__ == "__main__":
     try:
-        SwarmController()
+        controller = SwarmController()
+        # A short delay to ensure all subscribers are connected and poses are received
+        rospy.sleep(2)
+        controller.run()
     except rospy.ROSInterruptException:
         pass
