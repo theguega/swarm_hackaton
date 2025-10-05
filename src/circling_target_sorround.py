@@ -17,8 +17,9 @@ TARGETS = [(15, 15), (5, 5)]  # Example target positions in grid coordinates
 GOAL_TOLERANCE = 0.5  # meters
 LINEAR_SPEED = 0.3  # m/s
 ANGULAR_SPEED = 0.5  # rad/s
-SURROUND_RADIUS = 3.0 # meters
-MARGIN = 1.0 # minimum distance from walls
+SURROUND_RADIUS = 3.0  # meters
+MARGIN = 1.0  # minimum distance from walls
+
 
 class SwarmController:
     def __init__(self):
@@ -36,7 +37,9 @@ class SwarmController:
                 rospy.Subscriber(f"/{robot_id}/odom", Odometry, self.odom_callback, i)
             )
             self.laser_subs.append(
-                rospy.Subscriber(f"/{robot_id}/laser", LaserScan, self.laser_callback, i)
+                rospy.Subscriber(
+                    f"/{robot_id}/laser", LaserScan, self.laser_callback, i
+                )
             )
             self.cmd_pubs.append(
                 rospy.Publisher(f"/{robot_id}/cmd_vel", Twist, queue_size=1)
@@ -92,17 +95,20 @@ class SwarmController:
     def precompute_paths(self):
         """Precomputes Boustrophedon paths for each robot."""
         paths = []
-        initial_grid_positions = [self.world_to_grid(self.robot_poses[i]) for i in range(N_ROBOTS)]
+        initial_grid_positions = [
+            self.world_to_grid(self.robot_poses[i]) for i in range(N_ROBOTS)
+        ]
 
         # Wait for initial poses
         while any(pos is None for pos in initial_grid_positions):
-             rospy.sleep(0.1)
-             initial_grid_positions = [self.world_to_grid(self.robot_poses[i]) for i in range(N_ROBOTS)]
-
+            rospy.sleep(0.1)
+            initial_grid_positions = [
+                self.world_to_grid(self.robot_poses[i]) for i in range(N_ROBOTS)
+            ]
 
         for i in range(N_ROBOTS):
-             x0, y0 = initial_grid_positions[i]
-             paths.append(self.wall_then_spiral(x0, y0, nx, ny))
+            x0, y0 = initial_grid_positions[i]
+            paths.append(self.wall_then_spiral(x0, y0, nx, ny))
         return paths
 
     def boustrophedon_path(self, x_range, y_range):
@@ -149,7 +155,6 @@ class SwarmController:
         path.extend(self.boustrophedon_path(x_range, y_range))
         return path
 
-
     def move_to_goal(self, robot_index, goal_pos):
         """Moves a robot towards a goal position."""
         if self.robot_poses[robot_index] is None:
@@ -180,7 +185,7 @@ class SwarmController:
             twist.linear.x = LINEAR_SPEED
 
         self.cmd_pubs[robot_index].publish(twist)
-        return False # Goal not reached
+        return False  # Goal not reached
 
     def stop_robot(self, robot_index):
         """Stops a robot."""
@@ -192,10 +197,13 @@ class SwarmController:
 
         while not rospy.is_shutdown():
             if self.state == "SEARCHING":
+                print("Running SEARCHING state")
                 self.run_searching_state()
             elif self.state == "TARGET_FOUND":
+                print("Running TARGET_FOUND state")
                 self.run_target_found_state()
             elif self.state == "SURROUNDING":
+                print("Running SURROUNDING state")
                 self.run_surrounding_state()
 
             rate.sleep()
@@ -212,14 +220,17 @@ class SwarmController:
                 tx, ty = self.grid_to_world(current_grid_pos)
 
                 if tx < MARGIN or tx > Lx - MARGIN or ty < MARGIN or ty > Ly - MARGIN:
-                    rospy.logwarn(f"Robot {i} found target at {current_grid_pos}, but too close to wall. Continuing search.")
+                    rospy.logwarn(
+                        f"Robot {i} found target at {current_grid_pos}, but too close to wall. Continuing search."
+                    )
                 else:
                     self.target_found_by = i
                     self.chosen_target = self.grid_to_world(current_grid_pos)
                     self.state = "TARGET_FOUND"
-                    rospy.loginfo(f"Robot {i} found target at {current_grid_pos}. Transitioning to TARGET_FOUND.")
-                    return # Exit to immediately start the next state
-
+                    rospy.loginfo(
+                        f"Robot {i} found target at {current_grid_pos}. Transitioning to TARGET_FOUND."
+                    )
+                    return  # Exit to immediately start the next state
 
             # Move along Boustrophedon path
             if self.path_indices[i] < len(self.paths[i]):

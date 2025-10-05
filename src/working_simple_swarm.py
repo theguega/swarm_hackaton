@@ -6,14 +6,14 @@ from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
 
-NUM_ROBOTS = 7  # Scalable
-UPDATE_RATE = 10
+NUM_ROBOTS = 10  # Scalable
+UPDATE_RATE = 30
 REPULSION_DISTANCE = 0.8  # Distance to start repulsing from other robots
 OBSTACLE_DISTANCE = 0.5  # Distance to walls
-WALL_COLLISION_DISTANCE = 0.3  # Distance to consider wall collision
-RANDOM_CHANGE_TIME = 5.0  # Seconds to change random direction
-LINEAR_SPEED = 0.5
-ANGULAR_SPEED = 0.5
+WALL_COLLISION_DISTANCE = 0.4  # Distance to consider wall collision
+RANDOM_CHANGE_TIME = 7.0  # Seconds to change random direction
+LINEAR_SPEED = 0.2
+ANGULAR_SPEED = 0.2
 
 
 class SimpleSwarm:

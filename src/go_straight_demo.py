@@ -3,14 +3,14 @@ import rospy
 from geometry_msgs.msg import Twist
 
 
-def go_straight(robot_name="hero_2", speed=0.1, duration=5.0):
+def go_straight(robot_name="hero_2", speed=0.5, duration=5.0):
     """
     Makes the robot go straight forward slowly for a few seconds.
     """
+    rospy.init_node(f"go_straight_{robot_name}")
     pub = rospy.Publisher(
         f"/{robot_name}/velocity_controller/cmd_vel", Twist, queue_size=10
     )
-    rospy.init_node(f"go_straight_{robot_name}", anonymous=True)
     rate = rospy.Rate(10)
 
     rospy.loginfo(f"[{robot_name}] Going straight at {speed} m/s for {duration}s")
