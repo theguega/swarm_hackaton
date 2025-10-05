@@ -1,0 +1,48 @@
+<launch>
+  <!-- config -->
+  <arg name="swarm_size" default="4"/>
+  <arg name="max_speed" default="0.4"/>
+  <arg name="robot_radius" default="0.12"/>
+  <arg name="samples" default="500"/>
+  <arg name="evasion_strength" default="1.0"/>
+  <arg name="dt" default="0.1"/>
+
+  <group ns="">
+    <param name="swarm_size" value="$(arg swarm_size)"/>
+  </group>
+
+  <!-- spawn one node per hero namespace -->
+  <arg name="prefix" default="hero_"/>
+  <node pkg="roslaunch" type="roslaunch" name="dummy" respawn="false" required="false" if="$(arg swarm_size)"/>
+  <!-- instead of creating multiple <node> elements by hand, generate them using repeat via XML substitution -->
+  <!-- simple approach: create nodes for hero_0..hero_{N-1} via xml - generate up to N=10 for example -->
+  <!-- For flexibility, user can copy/paste or use a script to generate many entries. Example below shows 4 robots only. -->
+
+  <group ns="hero_0">
+    <node pkg="hero_swarm" type="swarm_agent.py" name="swarm_agent" output="screen">
+      <param name="robot_namespace" value="/hero_0"/>
+      <param name="swarm_size" value="$(arg swarm_size)"/>
+      <param name="max_speed" value="$(arg max_speed)"/>
+      <param name="robot_radius" value="$(arg robot_radius)"/>
+      <param name="samples" value="$(arg samples)"/>
+      <param name="evasion_strength" value="$(arg evasion_strength)"/>
+      <param name="dt_control" value="$(arg dt)"/>
+      <param name="goal" value="[1.5, 0.0]"/>
+    </node>
+  </group>
+
+  <group ns="hero_1">
+    <node pkg="hero_swarm" type="swarm_agent.py" name="swarm_agent" output="screen">
+      <param name="robot_namespace" value="/hero_1"/>
+      <param name="swarm_size" value="$(arg swarm_size)"/>
+      <param name="max_speed" value="$(arg max_speed)"/>
+      <param name="robot_radius" value="$(arg robot_radius)"/>
+      <param name="samples" value="$(arg samples)"/>
+      <param name="evasion_strength" value="$(arg evasion_strength)"/>
+      <param name="dt_control" value="$(arg dt)"/>
+      <param name="goal" value="[-1.5, 0.0]"/>
+    </node>
+  </group>
+
+  <!-- Add more groups for hero_2, hero_3, ... -->
+</launch>
